@@ -1,19 +1,8 @@
 #!/usr/bin/env python
 # coding: utf-8
 """
-╔══════════════════════════════════════════════════════════════════════════════╗
-║                                                                              ║
-║        🚦 ADVANCED TRAFFIC DETECTION SYSTEM – UNIFIED v3.4 🚦               ║
-║                                                                              ║
-║   Two-model hybrid pipeline:                                                 ║
-║     • YOLOv8n  → Real-time detection of traffic lights, stop signs,         ║
-║                  vehicles, persons  (bounding boxes + color)                ║
-║     • TFLite CNN → Per-crop classification of 43 road sign categories       ║
-║                   (speed limits, yield, no-entry, roundabout, …)            ║
-║                                                                              ║
-║   GUI: Tkinter  |  Inputs: image file, video file, live webcam              ║
-║                                                                              ║
-╚══════════════════════════════════════════════════════════════════════════════╝
+Advanced Traffic Detection System v3.4 - Raspberry Pi Edition
+Uses ONNX Runtime + TFLite (NO PyTorch, NO TensorFlow)
 """
 
 # ─── Standard library ────────────────────────────────────────────────────────
@@ -35,16 +24,16 @@ from PIL import Image, ImageTk
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
-# Deep-learning
-from ultralytics import YOLO
+# Deep-learning (lightweight - no torch!)
+import onnxruntime as ort
 import tflite_runtime.interpreter as tflite
 
 # ══════════════════════════════════════════════════════════════════════════════
 # CONFIGURATION
 # ══════════════════════════════════════════════════════════════════════════════
 
-YOLO_MODEL_PATH      = '/home/smartcar/newenv/models/yolov8n.onnx'
-TFLITE_MODEL_PATH    = '/home/smartcar/newenv/models/model_RTSR.tflite'
+YOLO_MODEL_PATH      = '/home/smartcar/newenv/smartcar-main/yolov8n.onnx'
+TFLITE_MODEL_PATH    = '/home/smartcar/newenv/smartcar-main/model_RTSR.tflite'
 CONFIDENCE_THRESHOLD = 0.25
 
 DISPLAY_W = 820
@@ -56,6 +45,28 @@ OUTPUT_DIR.mkdir(exist_ok=True)
 TRAFFIC_LIGHT_CLASS = 9
 STOP_SIGN_CLASS     = 11
 VEHICLE_CLASSES     = {'car', 'truck', 'bus', 'motorcycle', 'bicycle'}
+
+# Full COCO class names (80 classes)
+COCO_NAMES = {
+    0: 'person', 1: 'bicycle', 2: 'car', 3: 'motorcycle', 4: 'airplane',
+    5: 'bus', 6: 'train', 7: 'truck', 8: 'boat', 9: 'traffic light',
+    10: 'fire hydrant', 11: 'stop sign', 12: 'parking meter', 13: 'bench',
+    14: 'bird', 15: 'cat', 16: 'dog', 17: 'horse', 18: 'sheep', 19: 'cow',
+    20: 'elephant', 21: 'bear', 22: 'zebra', 23: 'giraffe', 24: 'backpack',
+    25: 'umbrella', 26: 'handbag', 27: 'tie', 28: 'suitcase', 29: 'frisbee',
+    30: 'skis', 31: 'snowboard', 32: 'sports ball', 33: 'kite',
+    34: 'baseball bat', 35: 'baseball glove', 36: 'skateboard',
+    37: 'surfboard', 38: 'tennis racket', 39: 'bottle', 40: 'wine glass',
+    41: 'cup', 42: 'fork', 43: 'knife', 44: 'spoon', 45: 'bowl',
+    46: 'banana', 47: 'apple', 48: 'sandwich', 49: 'orange', 50: 'broccoli',
+    51: 'carrot', 52: 'hot dog', 53: 'pizza', 54: 'donut', 55: 'cake',
+    56: 'chair', 57: 'couch', 58: 'potted plant', 59: 'bed',
+    60: 'dining table', 61: 'toilet', 62: 'tv', 63: 'laptop', 64: 'mouse',
+    65: 'remote', 66: 'keyboard', 67: 'cell phone', 68: 'microwave',
+    69: 'oven', 70: 'toaster', 71: 'sink', 72: 'refrigerator', 73: 'book',
+    74: 'clock', 75: 'vase', 76: 'scissors', 77: 'teddy bear',
+    78: 'hair drier', 79: 'toothbrush',
+}
 
 DETECTION_COLORS = {
     'red':      (0,   0,   255),
@@ -94,7 +105,7 @@ SIGN_CLASSES = {
 }
 
 # ══════════════════════════════════════════════════════════════════════════════
-# CNN RESULT CACHE  (LRU, max 64 entries)
+# CNN RESULT CACHE (LRU, max 64 entries)
 # ══════════════════════════════════════════════════════════════════════════════
 
 class _LRUCache:
@@ -119,27 +130,35 @@ _sign_cache = _LRUCache(maxsize=64)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# MODEL LOADING  (lazy singleton)
+# MODEL LOADING (lazy singleton)
 # ══════════════════════════════════════════════════════════════════════════════
 
-_yolo_model         = None
+_yolo_session       = None
 _tflite_interpreter = None
 
 
-def get_yolo_model() -> YOLO:
-    global _yolo_model
-    if _yolo_model is None:
+def get_yolo_model():
+    """Load YOLOv8 ONNX model using onnxruntime."""
+    global _yolo_session
+    if _yolo_session is None:
         if not os.path.exists(YOLO_MODEL_PATH):
-            print("ONNX model not found, converting from PT...")
-            pt_path  = YOLO_MODEL_PATH.replace('.onnx', '.pt')
-            pt_model = YOLO(pt_path)
-            pt_model.export(format='onnx', imgsz=320, half=False)
-        _yolo_model = YOLO(YOLO_MODEL_PATH, task='detect')
-        print("YOLOv8 ONNX ready")
-    return _yolo_model
+            raise FileNotFoundError(
+                f"YOLO ONNX model not found at {YOLO_MODEL_PATH}\n"
+                "Please export your YOLOv8 model to ONNX on your PC first:\n"
+                "  from ultralytics import YOLO\n"
+                "  model = YOLO('yolov8n.pt')\n"
+                "  model.export(format='onnx', imgsz=320)"
+            )
+        _yolo_session = ort.InferenceSession(
+            YOLO_MODEL_PATH,
+            providers=['CPUExecutionProvider']
+        )
+        print("YOLOv8 ONNX ready (onnxruntime)")
+    return _yolo_session
 
 
 def get_tflite_model():
+    """Load TFLite sign classification model."""
     global _tflite_interpreter
     if _tflite_interpreter is None:
         if not os.path.exists(TFLITE_MODEL_PATH):
@@ -151,6 +170,147 @@ def get_tflite_model():
         _tflite_interpreter.allocate_tensors()
         print("TFLite CNN ready")
     return _tflite_interpreter
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# YOLO ONNX POST-PROCESSING
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _xywh_to_xyxy(x, y, w, h):
+    """Convert center-x, center-y, width, height to x1,y1,x2,y2."""
+    return x - w / 2, y - h / 2, x + w / 2, y + h / 2
+
+
+def _nms(boxes, scores, iou_threshold=0.45):
+    """Simple Non-Maximum Suppression."""
+    if len(boxes) == 0:
+        return []
+
+    boxes  = np.array(boxes)
+    scores = np.array(scores)
+
+    x1 = boxes[:, 0]
+    y1 = boxes[:, 1]
+    x2 = boxes[:, 2]
+    y2 = boxes[:, 3]
+
+    areas   = (x2 - x1) * (y2 - y1)
+    order   = scores.argsort()[::-1]
+    keep    = []
+
+    while len(order) > 0:
+        i = order[0]
+        keep.append(i)
+
+        if len(order) == 1:
+            break
+
+        xx1 = np.maximum(x1[i], x1[order[1:]])
+        yy1 = np.maximum(y1[i], y1[order[1:]])
+        xx2 = np.minimum(x2[i], x2[order[1:]])
+        yy2 = np.minimum(y2[i], y2[order[1:]])
+
+        inter = np.maximum(0, xx2 - xx1) * np.maximum(0, yy2 - yy1)
+        iou   = inter / (areas[i] + areas[order[1:]] - inter + 1e-6)
+
+        mask  = iou <= iou_threshold
+        order = order[1:][mask]
+
+    return keep
+
+
+def run_yolo_onnx(frame, confidence=0.25):
+    """
+    Run YOLOv8 ONNX inference and return list of detections.
+    Each detection: {'bbox': [x1,y1,x2,y2], 'cls_id': int,
+                     'class_name': str, 'conf': float}
+    """
+    session    = get_yolo_model()
+    input_info = session.get_inputs()[0]
+    input_name = input_info.name
+
+    # Get expected input size
+    _, _, inp_h, inp_w = input_info.shape
+    if isinstance(inp_h, str):
+        inp_h, inp_w = 320, 320
+
+    h_orig, w_orig = frame.shape[:2]
+
+    # Preprocess: resize, normalize, transpose to NCHW
+    img     = cv2.resize(frame, (inp_w, inp_h))
+    img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+    blob    = img_rgb.astype(np.float32) / 255.0
+    blob    = np.transpose(blob, (2, 0, 1))       # HWC → CHW
+    blob    = np.expand_dims(blob, axis=0)         # add batch dim
+
+    # Run inference
+    outputs = session.run(None, {input_name: blob})
+    preds   = outputs[0]  # shape: (1, 84, N) for YOLOv8
+
+    # YOLOv8 output format: (1, 84, num_boxes) → transpose to (num_boxes, 84)
+    if preds.shape[1] == 84:
+        preds = np.transpose(preds[0])  # (N, 84)
+    elif preds.shape[2] == 84:
+        preds = preds[0]
+    else:
+        # Try old format (1, N, 85) with objectness score
+        preds = preds[0]
+
+    x_scale = w_orig / inp_w
+    y_scale = h_orig / inp_h
+
+    all_boxes  = []
+    all_scores = []
+    all_cls    = []
+
+    num_classes = preds.shape[1] - 4  # first 4 are bbox
+
+    for det in preds:
+        # YOLOv8: no objectness score, just class scores
+        cx, cy, bw, bh = det[0], det[1], det[2], det[3]
+        class_scores   = det[4:]
+
+        cls_id   = int(np.argmax(class_scores))
+        cls_conf = float(class_scores[cls_id])
+
+        if cls_conf < confidence:
+            continue
+
+        # Convert to original image coordinates
+        x1, y1, x2, y2 = _xywh_to_xyxy(cx, cy, bw, bh)
+        x1 = int(x1 * x_scale)
+        y1 = int(y1 * y_scale)
+        x2 = int(x2 * x_scale)
+        y2 = int(y2 * y_scale)
+
+        # Clamp
+        x1 = max(0, min(x1, w_orig))
+        y1 = max(0, min(y1, h_orig))
+        x2 = max(0, min(x2, w_orig))
+        y2 = max(0, min(y2, h_orig))
+
+        if x2 <= x1 or y2 <= y1:
+            continue
+
+        all_boxes.append([x1, y1, x2, y2])
+        all_scores.append(cls_conf)
+        all_cls.append(cls_id)
+
+    # Apply NMS
+    keep = _nms(all_boxes, all_scores, iou_threshold=0.45)
+
+    results = []
+    for i in keep:
+        cls_id     = all_cls[i]
+        class_name = COCO_NAMES.get(cls_id, f'class_{cls_id}')
+        results.append({
+            'bbox':       all_boxes[i],
+            'cls_id':     cls_id,
+            'class_name': class_name,
+            'conf':       all_scores[i],
+        })
+
+    return results
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -177,13 +337,15 @@ def classify_sign_crop(bgr_crop: np.ndarray) -> str:
         input_details  = interpreter.get_input_details()
         output_details = interpreter.get_output_details()
 
-        # Prepare input
         batch = np.expand_dims(arr, axis=0)
 
-        # Check if model expects normalized input
-        input_scale, input_zero_point = input_details[0].get('quantization', (0, 0))
-        if input_scale != 0:
-            batch = batch / 255.0
+        # Check if model expects uint8 or float32
+        if input_details[0]['dtype'] == np.uint8:
+            batch = batch.astype(np.uint8)
+        else:
+            # Normalize if float model
+            if batch.max() > 1.0:
+                batch = batch / 255.0
 
         interpreter.set_tensor(input_details[0]['index'], batch)
         interpreter.invoke()
@@ -200,7 +362,7 @@ def classify_sign_crop(bgr_crop: np.ndarray) -> str:
     return label
 
 
-def get_traffic_light_color(image: np.ndarray, bbox: np.ndarray) -> str:
+def get_traffic_light_color(image: np.ndarray, bbox) -> str:
     x1, y1, x2, y2 = map(int, bbox)
     h, w = image.shape[:2]
     x1, y1 = max(0, x1), max(0, y1)
@@ -226,7 +388,7 @@ def get_traffic_light_color(image: np.ndarray, bbox: np.ndarray) -> str:
     return max(scores, key=scores.get)
 
 
-def draw_box(frame: np.ndarray, bbox, label: str, color: tuple, thickness: int = 2):
+def draw_box(frame, bbox, label, color, thickness=2):
     x1, y1, x2, y2 = map(int, bbox)
     cv2.rectangle(frame, (x1, y1), (x2, y2), color, thickness)
     font, fs, ft = cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1
@@ -236,10 +398,9 @@ def draw_box(frame: np.ndarray, bbox, label: str, color: tuple, thickness: int =
                 (255, 255, 255), ft, cv2.LINE_AA)
 
 
-def process_frame(frame: np.ndarray,
-                  confidence: float = CONFIDENCE_THRESHOLD) -> tuple:
-    yolo    = get_yolo_model()
-    results = yolo.predict(frame, verbose=False, conf=confidence, imgsz=320)
+def process_frame(frame, confidence=CONFIDENCE_THRESHOLD):
+    """Process a single frame through YOLO + TFLite pipeline."""
+    results = run_yolo_onnx(frame, confidence)
 
     detections = {
         'traffic_lights': [],
@@ -248,61 +409,60 @@ def process_frame(frame: np.ndarray,
         'persons':        0
     }
 
-    for result in results:
-        for box in result.boxes:
-            cls_id     = int(box.cls[0])
-            conf       = float(box.conf[0])
-            bbox       = box.xyxy[0].cpu().numpy()
-            class_name = yolo.names[cls_id]
+    for det in results:
+        cls_id     = det['cls_id']
+        conf       = det['conf']
+        bbox       = det['bbox']
+        class_name = det['class_name']
 
-            if cls_id == TRAFFIC_LIGHT_CLASS:
-                x1, y1, x2, y2 = bbox
-                w_box      = x2 - x1
-                h_box      = y2 - y1
-                aspect_ratio = (w_box / h_box) if h_box > 0 else 0
-                if aspect_ratio > 0.6:
-                    continue
-                color     = get_traffic_light_color(frame, bbox)
-                box_color = DETECTION_COLORS.get(color, DETECTION_COLORS['unknown'])
-                draw_box(frame, bbox,
-                         f"TL: {color.upper()} {conf:.0%}", box_color)
-                detections['traffic_lights'].append(
-                    {'color': color, 'conf': conf, 'bbox': bbox.tolist()})
+        if cls_id == TRAFFIC_LIGHT_CLASS:
+            x1, y1, x2, y2 = bbox
+            w_box = x2 - x1
+            h_box = y2 - y1
+            aspect_ratio = (w_box / h_box) if h_box > 0 else 0
+            if aspect_ratio > 0.6:
+                continue
+            color     = get_traffic_light_color(frame, bbox)
+            box_color = DETECTION_COLORS.get(color, DETECTION_COLORS['unknown'])
+            draw_box(frame, bbox,
+                     f"TL: {color.upper()} {conf:.0%}", box_color)
+            detections['traffic_lights'].append(
+                {'color': color, 'conf': conf, 'bbox': bbox})
 
-            elif cls_id == STOP_SIGN_CLASS:
-                x1, y1, x2, y2 = map(int, bbox)
-                crop       = frame[max(0, y1):y2, max(0, x1):x2]
-                sign_label = classify_sign_crop(crop) if crop.size > 0 else "Stop sign"
-                draw_box(frame, bbox,
-                         f"{sign_label[:28]} {conf:.0%}",
-                         DETECTION_COLORS['stop_sign'])
-                detections['stop_signs'].append(
-                    {'label': sign_label, 'conf': conf, 'bbox': bbox.tolist()})
+        elif cls_id == STOP_SIGN_CLASS:
+            x1, y1, x2, y2 = bbox
+            crop       = frame[max(0, y1):y2, max(0, x1):x2]
+            sign_label = classify_sign_crop(crop) if crop.size > 0 else "Stop sign"
+            draw_box(frame, bbox,
+                     f"{sign_label[:28]} {conf:.0%}",
+                     DETECTION_COLORS['stop_sign'])
+            detections['stop_signs'].append(
+                {'label': sign_label, 'conf': conf, 'bbox': bbox})
 
-            elif class_name in VEHICLE_CLASSES:
-                draw_box(frame, bbox,
-                         f"{class_name.upper()} {conf:.0%}",
-                         DETECTION_COLORS['vehicle'])
-                detections['vehicles'].append(
-                    {'type': class_name, 'conf': conf, 'bbox': bbox.tolist()})
+        elif class_name in VEHICLE_CLASSES:
+            draw_box(frame, bbox,
+                     f"{class_name.upper()} {conf:.0%}",
+                     DETECTION_COLORS['vehicle'])
+            detections['vehicles'].append(
+                {'type': class_name, 'conf': conf, 'bbox': bbox})
 
-            elif class_name == 'person':
-                x1, y1, x2, y2 = map(int, bbox)
-                cv2.rectangle(frame, (x1, y1), (x2, y2),
-                              DETECTION_COLORS['person'], 2)
-                detections['persons'] += 1
+        elif class_name == 'person':
+            x1, y1, x2, y2 = bbox
+            cv2.rectangle(frame, (x1, y1), (x2, y2),
+                          DETECTION_COLORS['person'], 2)
+            detections['persons'] += 1
 
     _draw_hud(frame, detections)
     return frame, detections
 
 
-def _draw_hud(frame: np.ndarray, detections: dict):
+def _draw_hud(frame, detections):
     h, w = frame.shape[:2]
     cv2.rectangle(frame, (0, 0), (w, 40), (0, 0, 0), -1)
-    tl  = len(detections['traffic_lights'])
-    st  = len(detections['stop_signs'])
-    ve  = len(detections['vehicles'])
-    pe  = detections['persons']
+    tl = len(detections['traffic_lights'])
+    st = len(detections['stop_signs'])
+    ve = len(detections['vehicles'])
+    pe = detections['persons']
     hud = (f"Traffic Lights: {tl}  |  Signs: {st}  |  "
            f"Vehicles: {ve}  |  Persons: {pe}")
     cv2.putText(frame, hud, (10, 27),
@@ -314,7 +474,7 @@ def _draw_hud(frame: np.ndarray, detections: dict):
 # BACKGROUND WORKER THREAD
 # ══════════════════════════════════════════════════════════════════════════════
 
-FRAME_SKIP = 2   # Skip more frames on Pi to keep it smooth
+FRAME_SKIP = 2
 
 
 class DetectionWorker(threading.Thread):
@@ -333,7 +493,7 @@ class DetectionWorker(threading.Thread):
         self._running = False
 
     def run(self):
-        # ── Single image ──────────────────────────────────────────────────────
+        # Single image
         if isinstance(self.source, str) and self.source.lower().endswith(
                 ('.jpg', '.jpeg', '.png', '.bmp', '.ppm')):
             img = cv2.imread(self.source)
@@ -344,13 +504,13 @@ class DetectionWorker(threading.Thread):
             annotated, dets = process_frame(img, self.confidence)
             self.on_frame(annotated, dets)
             self.on_status(
-                f"Image processed – TL: {len(dets['traffic_lights'])}  "
+                f"Image processed - TL: {len(dets['traffic_lights'])}  "
                 f"Signs: {len(dets['stop_signs'])}  "
                 f"Vehicles: {len(dets['vehicles'])}")
             self.on_finished()
             return
 
-        # ── Video / webcam ────────────────────────────────────────────────────
+        # Video / webcam
         is_camera = isinstance(self.source, int)
         cap = cv2.VideoCapture(self.source)
         if not cap.isOpened():
@@ -398,13 +558,12 @@ class DetectionWorker(threading.Thread):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# MAIN GUI WINDOW  (Tkinter)
+# MAIN GUI WINDOW (Tkinter)
 # ══════════════════════════════════════════════════════════════════════════════
 
 _DISPLAY_INTERVAL_MS = 33
 _SIDEBAR_INTERVAL_MS = 125
 
-# Colors
 BG       = "#12121e"
 BG2      = "#1a1a2e"
 GOLD     = "#FFD700"
@@ -422,9 +581,9 @@ SEP      = "#444444"
 
 class MainWindow:
 
-    def __init__(self, root: tk.Tk):
+    def __init__(self, root):
         self.root = root
-        self.root.title("Traffic Detection System v3.4")
+        self.root.title("Traffic Detection System v3.4 (Pi Edition)")
         self.root.geometry("1280x780")
         self.root.configure(bg=BG)
         self.root.resizable(True, True)
@@ -436,12 +595,10 @@ class MainWindow:
         self._last_sidebar_t = 0.0
         self._models_ready   = False
 
-        # FPS tracking
         self._fps_frame_count  = 0
         self._fps_window_start = time.monotonic()
         self._current_fps      = 0.0
 
-        # Thread-safe frame handoff
         self._pending_frame = None
         self._pending_dets  = None
         self._frame_lock    = threading.Lock()
@@ -449,25 +606,18 @@ class MainWindow:
         self._build_ui()
         self._preload_models()
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
-
-        # Poll for new frames every 33 ms on the main thread
         self.root.after(33, self._poll_frame)
 
-    # ── UI Construction ───────────────────────────────────────────────────────
-
     def _build_ui(self):
-        # Title
         tk.Label(self.root,
-                 text="Advanced Traffic Detection System – Dual Model",
+                 text="Advanced Traffic Detection System - Dual Model",
                  bg=BG, fg=GOLD,
                  font=("Georgia", 18, "bold"),
                  pady=8).pack(fill="x")
 
-        # Content row
         content = tk.Frame(self.root, bg=BG)
         content.pack(fill="both", expand=True, padx=8, pady=4)
 
-        # Display canvas
         canvas_frame = tk.Frame(content, bg="#1a1a2e",
                                 bd=2, relief="flat",
                                 highlightbackground=SEP,
@@ -483,13 +633,9 @@ class MainWindow:
         self.display_label.pack()
         self.display_label.config(width=DISPLAY_W, height=DISPLAY_H)
 
-        # Sidebar
         self._build_sidebar(content)
-
-        # Controls
         self._build_controls()
 
-        # Status bar
         self.status_var = tk.StringVar(value="Loading models...")
         tk.Label(self.root,
                  textvariable=self.status_var,
@@ -519,7 +665,7 @@ class MainWindow:
                      bg=BG2, fg=color,
                      font=("Helvetica", 11, "bold"),
                      anchor="w").pack(fill="x", pady=(6, 0))
-            var = tk.StringVar(value="–")
+            var = tk.StringVar(value="-")
             tk.Label(sidebar, textvariable=var,
                      bg=BG2, fg=TEXT,
                      font=("Helvetica", 10),
@@ -560,7 +706,6 @@ class MainWindow:
                                   bg=BTN_STOP, fg="white")
         self.btn_save  = make_btn(btn_row, "Save Frame",  self._save_frame)
 
-        # Confidence slider
         conf_row = tk.Frame(ctrl_frame, bg=BG2)
         conf_row.pack(fill="x")
 
@@ -583,8 +728,6 @@ class MainWindow:
 
         self._set_buttons_enabled(False)
 
-    # ── Model preloading ──────────────────────────────────────────────────────
-
     def _preload_models(self):
         def _load():
             self._set_status("Loading YOLOv8 ONNX model...")
@@ -601,18 +744,16 @@ class MainWindow:
                 self._set_status(f"TFLite CNN load failed: {e}")
                 return
 
-            self._set_status("All models ready – select an image, video or camera.")
+            self._set_status("All models ready - select an image, video or camera.")
             self._models_ready = True
             self.root.after(0, lambda: self._set_buttons_enabled(True))
 
         threading.Thread(target=_load, daemon=True).start()
 
-    # ── Slots / callbacks ─────────────────────────────────────────────────────
-
-    def _set_status(self, msg: str):
+    def _set_status(self, msg):
         self.root.after(0, lambda: self.status_var.set(msg))
 
-    def _set_buttons_enabled(self, enabled: bool):
+    def _set_buttons_enabled(self, enabled):
         state = "normal" if enabled else "disabled"
         bg    = BTN_BG   if enabled else "#555555"
         fg    = BTN_FG   if enabled else "#888888"
@@ -666,7 +807,7 @@ class MainWindow:
             self._worker.join(timeout=3)
         self._worker = None
 
-    def _on_frame_from_thread(self, frame: np.ndarray, dets: dict):
+    def _on_frame_from_thread(self, frame, dets):
         with self._frame_lock:
             self._pending_frame = frame
             self._pending_dets  = dets
@@ -682,7 +823,6 @@ class MainWindow:
             now = time.monotonic()
             self._last_frame = frame
 
-            # FPS calculation
             self._fps_frame_count += 1
             elapsed = now - self._fps_window_start
             if elapsed >= 1.0:
@@ -690,7 +830,7 @@ class MainWindow:
                 self._fps_frame_count  = 0
                 self._fps_window_start = now
                 self.root.title(
-                    f"Traffic Detection System v3.4  –  "
+                    f"Traffic Detection System v3.4  -  "
                     f"{self._current_fps:.1f} FPS")
 
             if (now - self._last_display_t) * 1000 >= _DISPLAY_INTERVAL_MS:
@@ -721,9 +861,7 @@ class MainWindow:
         cv2.imwrite(path, self._last_frame)
         self._set_status(f"Saved: {path}")
 
-    # ── Display ───────────────────────────────────────────────────────────────
-
-    def _show_frame(self, bgr: np.ndarray):
+    def _show_frame(self, bgr):
         rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
         pil = Image.fromarray(rgb)
         pil.thumbnail((DISPLAY_W, DISPLAY_H), Image.LANCZOS)
@@ -731,7 +869,7 @@ class MainWindow:
         self.display_label.config(image=photo, text="")
         self.display_label.image = photo
 
-    def _update_sidebar(self, dets: dict):
+    def _update_sidebar(self, dets):
         tls = dets.get('traffic_lights', [])
         self.log_vars['tl_label'].set(
             f"{len(tls)} detected\n" +
@@ -746,7 +884,7 @@ class MainWindow:
 
         vehicles = dets.get('vehicles', [])
         if vehicles:
-            counts: dict = {}
+            counts = {}
             for v in vehicles:
                 counts[v['type']] = counts.get(v['type'], 0) + 1
             self.log_vars['ve_label'].set(
@@ -757,8 +895,6 @@ class MainWindow:
 
         pe = dets.get('persons', 0)
         self.log_vars['pe_label'].set(str(pe) if pe else "None")
-
-    # ── Cleanup ───────────────────────────────────────────────────────────────
 
     def _on_close(self):
         self._stop_worker()

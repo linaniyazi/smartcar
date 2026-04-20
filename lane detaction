@@ -100,8 +100,8 @@ def process_frame(frame):
     return final_frame
 def main():
     parser = argparse.ArgumentParser(description='Lane Detection for Autonomous Cars (Final Version)')
-    parser.add_argument('--input', type=str, default='/home/smartcar/newenv/codes/test_videos/solidYellowLeft.mp4', help='Path to input video file (e.g., path/to/video.mp4)')
-    parser.add_argument('--camera', type=int, default=None, help='Camera index to use (e.g., 0 for built-in camera)')
+    parser.add_argument('--input', type=str, help='Path to input video file (e.g., path/to/video.mp4)')
+    parser.add_argument('--camera', type=int, default=0, help='Camera index to use (e.g., 0 for Raspberry Pi camera)')
     parser.add_argument('--output', type=str, default='output_processed.mp4', help='Path to save output video')
     args = parser.parse_args()
     
@@ -146,6 +146,10 @@ def main():
             
             processed = process_frame(frame)
             if out: out.write(processed)
+            
+            cv2.imshow('Lane Detection', processed)
+            if cv2.waitKey(1) & 0xFF == ord('q'):
+                break
             
             frame_idx += 1
             if frame_idx % 30 == 0:

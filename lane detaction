@@ -1,0 +1,164 @@
+
+
+
+
+import cv2
+import numpy as np
+import time
+import argparse
+import sys
+import os
+def grayscale(img):
+    """ÃŠÃÃ¦Ã­Ã¡ Ã‡Ã¡Ã•Ã¦Ã‘Ã‰ Ã…Ã¡Ã¬ Ã‡Ã¡ÃŠÃÃ‘ÃŒ Ã‡Ã¡Ã‘Ã£Ã‡ÃÃ­."""
+    return cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+def color_mask(img):
+    """ÃšÃ’Ã¡ Ã‡Ã¡ÃƒÃ¡Ã¦Ã‡Ã¤ Ã‡Ã¡ÃˆÃ­Ã–Ã‡Ã Ã¦Ã‡Ã¡Ã•ÃÃ‘Ã‡Ã ÃˆÃ‡Ã“ÃŠÃŽÃÃ‡Ã£ Ã£Ã“Ã‡ÃÃ‰ HLS."""
+    hsl = cv2.cvtColor(img, cv2.COLOR_BGR2HLS)
+    
+    # ÃžÃ¤Ã‡Ãš Ã‡Ã¡Ã¡Ã¦Ã¤ Ã‡Ã¡ÃƒÃˆÃ­Ã–
+    lower_white = np.array([0, 200, 0], dtype=np.uint8)
+    upper_white = np.array([180, 255, 255], dtype=np.uint8)
+    white_mask = cv2.inRange(hsl, lower_white, upper_white)
+    
+    # ÃžÃ¤Ã‡Ãš Ã‡Ã¡Ã¡Ã¦Ã¤ Ã‡Ã¡ÃƒÃ•ÃÃ‘
+    lower_yellow = np.array([10, 0, 100], dtype=np.uint8)
+    upper_yellow = np.array([40, 255, 255], dtype=np.uint8)
+    yellow_mask = cv2.inRange(hsl, lower_yellow, upper_yellow)
+    
+    # ÃÃ£ÃŒ Ã‡Ã¡ÃƒÃžÃ¤ÃšÃ‰
+    combined_mask = cv2.bitwise_or(white_mask, yellow_mask)
+    return cv2.bitwise_and(img, img, mask=combined_mask)
+def canny(img, low_threshold, high_threshold):
+    """ÃŠÃ˜ÃˆÃ­Ãž ÃŽÃ¦Ã‡Ã‘Ã’Ã£Ã­Ã‰ Canny Ã¡Ã‡ÃŸÃŠÃ”Ã‡Ã Ã‡Ã¡ÃÃ¦Ã‡Ã."""
+    return cv2.Canny(img, low_threshold, high_threshold)
+def gaussian_blur(img, kernel_size):
+    """ÃŠÃ˜ÃˆÃ­Ãž ÃŠÃ¤ÃšÃ­Ã£ Gaussian Ã¡ÃŠÃžÃ¡Ã­Ã¡ Ã‡Ã¡Ã–Ã¦Ã–Ã‡Ã."""
+    return cv2.GaussianBlur(img, (kernel_size, kernel_size), 0)
+def region_of_interest(img, vertices):
+    """ÃŠÃÃÃ­Ã Ã£Ã¤Ã˜ÃžÃ‰ Ã‡Ã¡Ã‡Ã¥ÃŠÃ£Ã‡Ã£ (ROI)."""
+    mask = np.zeros_like(img)   
+    ignore_mask_color = 255 if len(img.shape) == 2 else (255,) * img.shape[2]
+    cv2.fillPoly(mask, vertices, ignore_mask_color)
+    return cv2.bitwise_and(img, mask)
+def draw_lines(img, lines, color=[0, 0, 255], thickness=10):
+    """Ã‘Ã“Ã£ Ã‡Ã¡Ã£Ã“Ã‡Ã‘Ã‡ÃŠ Ã‡Ã¡Ã£Ã£ÃÃÃ‰."""
+    if lines is None: return
+    left_lines, left_weights = [], []
+    right_lines, right_weights = [], []
+    for line in lines:
+        for x1, y1, x2, y2 in line:
+            if x2 == x1: continue
+            slope = (y2 - y1) / (x2 - x1)
+            intercept = y1 - slope * x1
+            length = np.sqrt((y2 - y1)**2 + (x2 - x1)**2)
+            
+            if -0.9 < slope < -0.5:
+                left_lines.append((slope, intercept))
+                left_weights.append(length)
+            elif 0.5 < slope < 0.9:
+                right_lines.append((slope, intercept))
+                right_weights.append(length)
+    h, w = img.shape[:2]
+    y1, y2 = h, int(h * 0.2)
+    if left_lines:
+        ls = np.average([l[0] for l in left_lines], weights=left_weights)
+        li = np.average([l[1] for l in left_lines], weights=left_weights)
+        try:
+            cv2.line(img, (int((y1 - li) / ls), y1), (int((y2 - li) / ls), y2), color, thickness)
+        except: pass
+    if right_lines:
+        rs = np.average([r[0] for r in right_lines], weights=right_weights)
+        ri = np.average([r[1] for r in right_lines], weights=right_weights)
+        try:
+            cv2.line(img, (int((y1 - ri) / rs), y1), (int((y2 - ri) / rs), y2), color, thickness)
+        except: pass
+def process_frame(frame):
+    """ÃŽÃ˜ Ã£ÃšÃ‡Ã¡ÃŒÃ‰ Ã‡Ã¡Ã…Ã˜Ã‡Ã‘ Ã‡Ã¡Ã¦Ã‡ÃÃ Ã£Ãš Ã‡ÃžÃŠÃ˜Ã‡Ãš Ã‡Ã¡Ã¤Ã•Ã Ã‡Ã¡Ã“ÃÃ¡Ã­ Ã¡Ã’Ã­Ã‡ÃÃ‰ Ã‡Ã¡Ã“Ã‘ÃšÃ‰."""
+    h, w = frame.shape[:2]
+    half_h = h // 2
+    bottom_half = frame[half_h:, :]
+    
+    masked = color_mask(bottom_half)
+    gray = grayscale(masked)
+    blur = gaussian_blur(gray, 5)
+    edges = canny(blur, 50, 150)
+    
+    roi_h, roi_w = bottom_half.shape[:2]
+    vertices = np.array([[(int(roi_w*0.05), roi_h), (int(roi_w*0.45), int(roi_h*0.1)), 
+                          (int(roi_w*0.55), int(roi_h*0.1)), (int(roi_w*0.95), roi_h)]], dtype=np.int32)
+    roi_edges = region_of_interest(edges, vertices)
+    
+    lines = cv2.HoughLinesP(roi_edges, 1, np.pi/180, 20, np.array([]), minLineLength=20, maxLineGap=300)
+    
+    line_img = np.zeros_like(bottom_half)
+    draw_lines(line_img, lines)
+    
+    processed_bottom = cv2.addWeighted(bottom_half, 0.8, line_img, 1.0, 0.0)
+    final_frame = frame.copy()
+    final_frame[half_h:, :] = processed_bottom
+    
+    return final_frame
+def main():
+    parser = argparse.ArgumentParser(description='Lane Detection for Autonomous Cars (Final Version)')
+    parser.add_argument('--input', type=str, default='/home/smartcar/newenv/codes/test_videos/solidYellowLeft.mp4', help='Path to input video file (e.g., path/to/video.mp4)')
+    parser.add_argument('--camera', type=int, default=None, help='Camera index to use (e.g., 0 for built-in camera)')
+    parser.add_argument('--output', type=str, default='output_processed.mp4', help='Path to save output video')
+    args = parser.parse_args()
+    
+    if args.input:
+        input_dir = os.path.dirname(args.input)
+        if input_dir and args.output == 'output_processed.mp4':
+            args.output = os.path.join(input_dir, 'output_processed.mp4')
+    
+    # ÃŠÃÃÃ­Ã Ã£Ã•ÃÃ‘ Ã‡Ã¡ÃÃ­ÃÃ­Ã¦
+    if args.camera is not None:
+        print(f"Using Camera Source: Index {args.camera}")
+        source = args.camera
+    elif args.input is not None:
+        print(f"Using Video File: {args.input}")
+        source = args.input
+    else:
+        print("\n[!] Error: You must provide either --input <video_path> or --camera <camera_index>")
+        print("Usage examples:")
+        print("  python3 lane_detection_final.py --input path/to/video.mp4")
+        print("  python3 lane_detection_final.py --camera 0")
+        sys.exit(1)
+    cap = cv2.VideoCapture(source)
+    if not cap.isOpened():
+        print(f"Error: Could not open source: {source}")
+        return
+    # Ã…ÃšÃÃ‡Ã Ã‡Ã¡ÃÃÃ™ (ÃÃžÃ˜ Ã…ÃÃ‡ ÃŸÃ‡Ã¤ Ã‡Ã¡Ã£Ã•ÃÃ‘ Ã£Ã¡Ã ÃÃ­ÃÃ­Ã¦)
+    out = None
+    if isinstance(source, str):
+        w, h = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)), int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        fps = cap.get(cv2.CAP_PROP_FPS)
+        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+        out = cv2.VideoWriter(args.output, fourcc, fps, (w, h))
+        print(f"Saving output to: {args.output}")
+    print("\nProcessing... Press Ctrl+C to stop.")
+    
+    try:
+        frame_idx = 0
+        start_time = time.time()
+        while cap.isOpened():
+            ret, frame = cap.read()
+            if not ret: break
+            
+            processed = process_frame(frame)
+            if out: out.write(processed)
+            
+            frame_idx += 1
+            if frame_idx % 30 == 0:
+                elapsed = time.time() - start_time
+                print(f"Processed {frame_idx} frames. Speed: {frame_idx/elapsed:.2f} FPS", end='\r')
+                
+    except KeyboardInterrupt:
+        print("\n\nStopped by user.")
+    finally:
+        cap.release()
+        if out: out.release()
+        print(f"\nFinished. Total frames processed: {frame_idx}")
+if __name__ == "__main__":
+    main()
+
+

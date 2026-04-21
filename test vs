@@ -1,31 +1,110 @@
-import serial
-import time
+#include <Servo.h>
 
-# تصحيح: serial.Serial وليس serial.serial
-ser = serial.Serial('/dev/ttyACM0', 9600, timeout=1.0)
-time.sleep(2)
-ser.reset_input_buffer()
-print("Serial جاهز")
+// ========== إعداد الأطراف ==========
+const int ENA_PIN  = 6;   // PWM للسرعة
+const int IN1_PIN  = 5;   // اتجاه الدوران
+const int IN2_PIN  = 4;   // اتجاه الدوران
+const int SERVO_PIN = 9;  // Servo
 
-try:
-    while True:
-        speed = int(input("أدخل السرعة (0-255): "))
-        angle = int(input("أدخل الزاوية (0-180): "))
+Servo myServo;
+String inputBuffer = "";
+int currentSpeed = 0;
+int currentAngle = 90;
 
-        # التحقق من النطاق
-        speed = max(0, min(255, speed))
-        angle = max(0, min(180, angle))
+// ========== الإعداد الأولي ==========
+void setup() {
+  Serial.begin(9600);
 
-        message = f"SPEED:{speed};ANGLE:{angle}\n"
-        ser.write(message.encode('utf-8'))
-        print(f"أُرسل: {message.strip()}")
+  pinMode(ENA_PIN, OUTPUT);
+  pinMode(IN1_PIN, OUTPUT);
+  pinMode(IN2_PIN, OUTPUT);
 
-        # انتظار رد Arduino
-        time.sleep(0.1)
-        if ser.in_waiting > 0:
-            response = ser.readline().decode('utf-8').rstrip()
-            print(f"Arduino رد: {response}")
+  // محرك متوقف عند البداية
+  stopMotor();
 
-except KeyboardInterrupt:
-    print("إغلاق الاتصال")
-    ser.close()
+  myServo.attach(SERVO_PIN);
+  myServo.write(currentAngle);
+
+  Serial.println("Arduino جاهز");
+}
+
+// ========== الحلقة الرئيسية ==========
+void loop() {
+  while (Serial.available() > 0) {
+    char c = Serial.read();
+    if (c == '\n') {
+      parseMessage(inputBuffer);
+      inputBuffer = "";
+    } else {
+      inputBuffer += c;
+    }
+  }
+}
+
+// ========== دوال التحكم بالمحرك ==========
+void stopMotor() {
+  digitalWrite(IN1_PIN, LOW);
+  digitalWrite(IN2_PIN, LOW);
+  analogWrite(ENA_PIN, 0);
+}
+
+void runMotorForward(int speed) {
+  digitalWrite(IN1_PIN, HIGH);
+  digitalWrite(IN2_PIN, LOW);
+  analogWrite(ENA_PIN, speed);
+}
+
+void runMotorBackward(int speed) {
+  digitalWrite(IN1_PIN, LOW);
+  digitalWrite(IN2_PIN, HIGH);
+  analogWrite(ENA_PIN, speed);
+}
+
+// ========== دالة تحليل الرسالة ==========
+void parseMessage(String msg) {
+  msg.trim();
+
+  if (msg.indexOf("SPEED:") == -1 || msg.indexOf("ANGLE:") == -1) {
+    Serial.println("خطأ: صيغة الرسالة غير صحيحة");
+    return;
+  }
+
+  int speedIndex    = msg.indexOf("SPEED:") + 6;
+  int semicolonIndex = msg.indexOf(";", speedIndex);
+  if (semicolonIndex == -1) {
+    Serial.println("خطأ: لا يوجد فاصل ;");
+    return;
+  }
+
+  String speedStr = msg.substring(speedIndex, semicolonIndex);
+  String angleStr = msg.substring(msg.indexOf("ANGLE:") + 6);
+
+  int newSpeed = speedStr.toInt();
+  int newAngle = angleStr.toInt();
+
+  // السرعة: -255 إلى 255 (السالب = عكس الاتجاه)
+  if (newSpeed < -255 || newSpeed > 255) {
+    Serial.println("خطأ: السرعة خارج النطاق (-255 إلى 255)");
+    return;
+  }
+  if (newAngle < 0 || newAngle > 180) {
+    Serial.println("خطأ: الزاوية خارج النطاق (0-180)");
+    return;
+  }
+
+  // تطبيق الحركة حسب إشارة السرعة
+  if (newSpeed > 0) {
+    runMotorForward(newSpeed);
+  } else if (newSpeed < 0) {
+    runMotorBackward(abs(newSpeed));
+  } else {
+    stopMotor();
+  }
+
+  myServo.write(newAngle);
+
+  Serial.print("تم: SPEED=");
+  Serial.print(newSpeed);
+  Serial.print(" | ANGLE=");
+  Serial.println(newAngle);
+}

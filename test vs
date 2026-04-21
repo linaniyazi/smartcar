@@ -1,0 +1,31 @@
+import serial
+import time
+
+# تصحيح: serial.Serial وليس serial.serial
+ser = serial.Serial('/dev/ttyACM0', 9600, timeout=1.0)
+time.sleep(2)
+ser.reset_input_buffer()
+print("Serial جاهز")
+
+try:
+    while True:
+        speed = int(input("أدخل السرعة (0-255): "))
+        angle = int(input("أدخل الزاوية (0-180): "))
+
+        # التحقق من النطاق
+        speed = max(0, min(255, speed))
+        angle = max(0, min(180, angle))
+
+        message = f"SPEED:{speed};ANGLE:{angle}\n"
+        ser.write(message.encode('utf-8'))
+        print(f"أُرسل: {message.strip()}")
+
+        # انتظار رد Arduino
+        time.sleep(0.1)
+        if ser.in_waiting > 0:
+            response = ser.readline().decode('utf-8').rstrip()
+            print(f"Arduino رد: {response}")
+
+except KeyboardInterrupt:
+    print("إغلاق الاتصال")
+    ser.close()

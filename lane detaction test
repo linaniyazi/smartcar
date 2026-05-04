@@ -1,0 +1,438 @@
+import cv2
+import numpy as np
+import time
+import sys
+import serial
+import signal
+
+# ============================================================
+# إعدادات الاتصال التسلسلي مع الأردوينو (اختياري)
+# ============================================================
+SERIAL_PORT = '/dev/ttyACM0'  # منفذ الأردوينو
+BAUD_RATE = 115200
+
+# بروتوكول الأردوينو
+START_BYTE = 0xAA
+END_BYTE = 0x55
+STEER_MIN = 0      # أقصى يسار
+STEER_CENTER = 50  # مستقيم
+STEER_MAX = 100    # أقصى يمين
+
+# إعدادات الأداء
+FRAME_SKIP = 2       # معالجة 1 من كل 2 فريم لزيادة السرعة
+SHOW_DEBUG = True    # عرض معلومات إضافية على الشاشة
+
+# ============================================================
+# دوال معالجة الصورة (محسنة للسرعة)
+# ============================================================
+
+def color_mask(img):
+    """فلترة الألوان البيضاء والصفراء"""
+    hsl = cv2.cvtColor(img, cv2.COLOR_BGR2HLS)
+    
+    # فلتر اللون الأبيض
+    lower_white = np.array([0, 200, 0], dtype=np.uint8)
+    upper_white = np.array([180, 255, 255], dtype=np.uint8)
+    white_mask = cv2.inRange(hsl, lower_white, upper_white)
+    
+    # فلتر اللون الأصفر
+    lower_yellow = np.array([10, 0, 100], dtype=np.uint8)
+    upper_yellow = np.array([40, 255, 255], dtype=np.uint8)
+    yellow_mask = cv2.inRange(hsl, lower_yellow, upper_yellow)
+    
+    combined_mask = cv2.bitwise_or(white_mask, yellow_mask)
+    return cv2.bitwise_and(img, img, mask=combined_mask)
+
+def region_of_interest(img):
+    """تحديد منطقة الاهتمام (الطريق فقط)"""
+    h, w = img.shape[:2]
+    vertices = np.array([[
+        (int(w*0.1), h),           # أسفل يمين
+        (int(w*0.45), int(h*0.6)), # أعلى يمين
+        (int(w*0.55), int(h*0.6)), # أعلى يسار
+        (int(w*0.9), h)            # أسفل يسار
+    ]], dtype=np.int32)
+    
+    mask = np.zeros_like(img)
+    cv2.fillPoly(mask, vertices, 255)
+    return cv2.bitwise_and(img, mask)
+
+def detect_lanes(edges):
+    """كشف المسارات باستخدام Hough Transform"""
+    lines = cv2.HoughLinesP(edges, 1, np.pi/180, 30, 
+                            np.array([]), minLineLength=30, maxLineGap=100)
+    
+    left_lines = []
+    right_lines = []
+    
+    if lines is not None:
+        for line in lines:
+            x1, y1, x2, y2 = line[0]
+            if x2 == x1:
+                continue
+            
+            slope = (y2 - y1) / (x2 - x1)
+            
+            # تجاهل الخطوط الأفقية
+            if abs(slope) < 0.4:
+                continue
+            
+            # تصنيف المسارات حسب الميل
+            if slope < 0:  # مسار أيسر (ميل سالب)
+                left_lines.append(line[0])
+            else:          # مسار أيمن (ميل موجب)
+                right_lines.append(line[0])
+    
+    return left_lines, right_lines
+
+def average_lane_lines(img, lines):
+    """حساب متوسط خطوط المسار ورسم خط واحد لكل جانب"""
+    if not lines:
+        return None
+    
+    # جمع جميع النقاط
+    points = []
+    for line in lines:
+        x1, y1, x2, y2 = line
+        points.append((x1, y1))
+        points.append((x2, y2))
+    
+    if len(points) < 2:
+        return None
+    
+    # حساب الخط الأكثر تمثيلاً
+    [vx, vy, x, y] = cv2.fitLine(np.array(points), cv2.DIST_L2, 0, 0.01, 0.01)
+    
+    # حساب نقاط بداية ونهاية الخط
+    h, w = img.shape[:2]
+    left_y = h
+    right_y = int(h * 0.6)
+    
+    try:
+        # حساب إحداثيات x بناءً على المعادلة
+        slope = vy / vx if vx != 0 else 0
+        
+        # تحديد النقاط على طول الخط
+        if slope != 0:
+            x1 = int(((left_y - y) * vx / vy) + x)
+            x2 = int(((right_y - y) * vx / vy) + x)
+            return (x1, left_y, x2, right_y)
+    except:
+        pass
+    
+    return None
+
+def draw_lane_lines(img, left_line, right_line):
+    """رسم خطوط المسار على الصورة"""
+    line_img = np.zeros_like(img)
+    
+    if left_line:
+        x1, y1, x2, y2 = left_line
+        cv2.line(line_img, (x1, y1), (x2, y2), (0, 0, 255), 8)
+    
+    if right_line:
+        x1, y1, x2, y2 = right_line
+        cv2.line(line_img, (x1, y1), (x2, y2), (0, 0, 255), 8)
+    
+    return line_img
+
+def compute_steering(left_line, right_line, frame_width):
+    """حساب زاوية التوجيه بناءً على موقع المسارات"""
+    center = frame_width // 2
+    
+    if left_line and right_line:
+        # إذا تم العثور على كلا المسارين
+        left_x = left_line[0]  # نقطة أسفل المسار الأيسر
+        right_x = right_line[0]  # نقطة أسفل المسار الأيمن
+        lane_center = (left_x + right_x) // 2
+        error = lane_center - center
+        
+        # تحويل الخطأ إلى قيمة توجيه (0-100)
+        max_error = frame_width // 4
+        steer_offset = np.clip(error / max_error, -1, 1) * 50
+        steer_value = STEER_CENTER + steer_offset
+        
+    elif left_line:
+        # فقط المسار الأيسر موجود
+        left_x = left_line[0]
+        error = left_x - center
+        steer_offset = np.clip(error / frame_width, -1, 1) * 40
+        steer_value = STEER_CENTER + steer_offset
+        
+    elif right_line:
+        # فقط المسار الأيمن موجود
+        right_x = right_line[0]
+        error = right_x - center
+        steer_offset = np.clip(error / frame_width, -1, 1) * 40
+        steer_value = STEER_CENTER - steer_offset
+        
+    else:
+        # لم يتم العثور على أي مسار
+        steer_value = STEER_CENTER
+    
+    return int(np.clip(steer_value, STEER_MIN, STEER_MAX))
+
+def compute_speed(steer_value, base_speed=60):
+    """حساب السرعة المناسبة حسب زاوية الانعطاف"""
+    # تقليل السرعة عند الانعطاف الحاد
+    turn_intensity = abs(steer_value - STEER_CENTER) / 50.0
+    speed = base_speed * (1.0 - turn_intensity * 0.3)
+    return int(np.clip(speed, 40, 80))
+
+def send_command(ser, speed, steer, direction_forward=True):
+    """إرسال أمر إلى الأردوينو"""
+    if ser is None or not ser.is_open:
+        return False
+    
+    dir_byte = 1 if direction_forward else 0
+    checksum = (speed + steer + dir_byte) % 256
+    
+    packet = bytes([START_BYTE, speed, steer, dir_byte, checksum, END_BYTE])
+    ser.write(packet)
+    return True
+
+# ============================================================
+# معالجة إشارة الإيقاف
+# ============================================================
+def signal_handler(sig, frame):
+    print("\n\n🛑 Stopping...")
+    if 'ser' in globals() and ser and ser.is_open:
+        send_command(ser, 0, STEER_CENTER, True)
+        time.sleep(0.1)
+        ser.close()
+    sys.exit(0)
+
+# ============================================================
+# الدالة الرئيسية
+# ============================================================
+def main():
+    global ser
+    
+    # إعداد معالج الإشارة للإيقاف الآمن
+    signal.signal(signal.SIGINT, signal_handler)
+    
+    # ===== إعداد الكاميرا =====
+    print("\n" + "="*50)
+    print("🚗 Lane Detection System for Real Car")
+    print("="*50)
+    
+    # محاولة فتح الكاميرا (0 عادةً لكاميرا Raspberry Pi)
+    camera_index = 0
+    cap = cv2.VideoCapture(camera_index)
+    
+    if not cap.isOpened():
+        print(f"❌ Error: Could not open camera {camera_index}")
+        print("   Trying camera 1...")
+        camera_index = 1
+        cap = cv2.VideoCapture(camera_index)
+        
+        if not cap.isOpened():
+            print("❌ Error: No camera found!")
+            print("   Make sure camera is connected and enabled")
+            return
+    
+    # ضبط إعدادات الكاميرا للسرعة
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+    cap.set(cv2.CAP_PROP_FPS, 30)
+    
+    print(f"✅ Camera {camera_index} opened successfully")
+    print(f"   Resolution: {int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))}x{int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))}")
+    
+    # ===== إعداد الاتصال التسلسلي =====
+    ser = None
+    use_serial = input("\n🤖 Connect to Arduino? (y/n): ").lower().strip() == 'y'
+    
+    if use_serial:
+        try:
+            ser = serial.Serial(SERIAL_PORT, BAUD_RATE, timeout=0.1)
+            time.sleep(2)
+            print(f"✅ Connected to Arduino on {SERIAL_PORT}")
+        except Exception as e:
+            print(f"⚠️ Could not connect to Arduino: {e}")
+            print("   Running in simulation mode")
+            ser = None
+    
+    # ===== إعدادات التحكم =====
+    print("\n" + "="*50)
+    manual_speed = input("Enter base speed (40-80, default 65): ").strip()
+    base_speed = int(manual_speed) if manual_speed.isdigit() else 65
+    base_speed = np.clip(base_speed, 40, 80)
+    
+    auto_speed = input("Auto speed control? (y/n, default y): ").strip().lower() != 'n'
+    
+    print("\n" + "="*50)
+    print("🎬 Starting Lane Detection...")
+    print("   Controls:")
+    print("   • 'q' - Quit")
+    print("   • 's' - Stop/Start car")
+    print("   • '+' / '-' - Increase/Decrease speed")
+    print("   • 'd' - Toggle debug info")
+    print("="*50 + "\n")
+    
+    # ===== متغيرات التحكم =====
+    frame_count = 0
+    car_running = True
+    show_debug = SHOW_DEBUG
+    current_speed = base_speed
+    last_command_time = time.time()
+    
+    # إحصائيات الأداء
+    fps = 0
+    fps_timer = time.time()
+    fps_counter = 0
+    
+    try:
+        while True:
+            # قراءة الإطار من الكاميرا
+            ret, frame = cap.read()
+            if not ret:
+                print("⚠️ Warning: Failed to grab frame")
+                time.sleep(0.01)
+                continue
+            
+            frame_count += 1
+            
+            # تجاوز بعض الفريمات لزيادة السرعة
+            if frame_count % FRAME_SKIP != 0:
+                continue
+            
+            # عمل نسخة للعرض
+            display_frame = frame.copy()
+            h, w = frame.shape[:2]
+            
+            # ===== معالجة الصورة =====
+            # اقتصاص النصف السفلي فقط (منطقة الطريق)
+            roi_frame = frame[h//2:, :]
+            
+            # تطبيق فلتر الألوان
+            masked = color_mask(roi_frame)
+            
+            # تحويل إلى灰度
+            gray = cv2.cvtColor(masked, cv2.COLOR_BGR2GRAY)
+            
+            # Gaussian blur لتقليل التشويش
+            blur = cv2.GaussianBlur(gray, (5, 5), 0)
+            
+            # كشف الحواف باستخدام Canny
+            edges = cv2.Canny(blur, 50, 150)
+            
+            # تطبيق منطقة الاهتمام على الحواف
+            roi_edges = region_of_interest(edges)
+            
+            # كشف المسارات
+            left_lines, right_lines = detect_lanes(roi_edges)
+            
+            # حساب متوسط الخطوط
+            left_line = average_lane_lines(roi_frame, left_lines)
+            right_line = average_lane_lines(roi_frame, right_lines)
+            
+            # ===== حساب التحكم =====
+            steer_value = compute_steering(left_line, right_line, w)
+            
+            if auto_speed:
+                current_speed = compute_speed(steer_value, base_speed)
+            
+            # ===== إرسال الأوامر =====
+            if car_running and current_speed > 0:
+                if ser and ser.is_open:
+                    send_command(ser, current_speed, steer_value, True)
+                    last_command_time = time.time()
+            elif ser and ser.is_open:
+                send_command(ser, 0, STEER_CENTER, True)
+            
+            # ===== رسم المسارات على الصورة =====
+            # تعديل إحداثيات الخطوط لتناسب الإطار الأصلي
+            if left_line:
+                x1, y1, x2, y2 = left_line
+                left_line_display = (x1, y1 + h//2, x2, y2 + h//2)
+                cv2.line(display_frame, (x1, y1 + h//2), (x2, y2 + h//2), (0, 0, 255), 6)
+            
+            if right_line:
+                x1, y1, x2, y2 = right_line
+                right_line_display = (x1, y1 + h//2, x2, y2 + h//2)
+                cv2.line(display_frame, (x1, y1 + h//2), (x2, y2 + h//2), (0, 0, 255), 6)
+            
+            # ===== عرض المعلومات =====
+            if show_debug:
+                # معلومات التحكم
+                color = (0, 255, 0) if car_running else (0, 0, 255)
+                status = "RUNNING" if car_running else "STOPPED"
+                cv2.putText(display_frame, f"Status: {status}", (10, 30), 
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
+                cv2.putText(display_frame, f"Steering: {steer_value}", (10, 60), 
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+                cv2.putText(display_frame, f"Speed: {current_speed}", (10, 90), 
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+                cv2.putText(display_frame, f"FPS: {fps:.1f}", (10, 120), 
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+                
+                # رسم خط الوسط
+                center = w // 2
+                cv2.line(display_frame, (center, h//2), (center, h), (255, 255, 0), 2)
+                cv2.circle(display_frame, (center, h-20), 8, (255, 255, 0), -1)
+                
+                # رسم مربع منطقة الاهتمام
+                vertices = np.array([[
+                    (int(w*0.1), h),
+                    (int(w*0.45), int(h*0.6)),
+                    (int(w*0.55), int(h*0.6)),
+                    (int(w*0.9), h)
+                ]], dtype=np.int32)
+                cv2.polylines(display_frame, vertices, True, (0, 255, 255), 2)
+            
+            else:
+                # عرض مبسط
+                cv2.putText(display_frame, f"Steer: {steer_value} | Speed: {current_speed}", 
+                           (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+            
+            # حساب FPS
+            fps_counter += 1
+            if time.time() - fps_timer >= 1.0:
+                fps = fps_counter
+                fps_counter = 0
+                fps_timer = time.time()
+                print(f"\rFPS: {fps} | Steer: {steer_value:3d} | Speed: {current_speed:3d} | Status: {status}", end='')
+            
+            # عرض النتيجة
+            cv2.imshow('Lane Detection - Real Car', display_frame)
+            
+            # معالجة مفاتيح التحكم
+            key = cv2.waitKey(1) & 0xFF
+            if key == ord('q'):
+                print("\n\nQuitting...")
+                break
+            elif key == ord('s'):
+                car_running = not car_running
+                status_text = "STARTED" if car_running else "STOPPED"
+                print(f"\n🚗 Car {status_text}")
+                if not car_running and ser:
+                    send_command(ser, 0, STEER_CENTER, True)
+            elif key == ord('+') or key == ord('='):
+                base_speed = min(base_speed + 5, 80)
+                print(f"\n📈 Base speed increased to: {base_speed}")
+            elif key == ord('-') or key == ord('_'):
+                base_speed = max(base_speed - 5, 40)
+                print(f"\n📉 Base speed decreased to: {base_speed}")
+            elif key == ord('d'):
+                show_debug = not show_debug
+                print(f"\n🔧 Debug mode: {'ON' if show_debug else 'OFF'}")
+    
+    except KeyboardInterrupt:
+        print("\n\n🛑 Interrupted by user")
+    
+    finally:
+        # تنظيف الموارد
+        print("\nCleaning up...")
+        if ser and ser.is_open:
+            print("Sending stop command to Arduino...")
+            send_command(ser, 0, STEER_CENTER, True)
+            time.sleep(0.2)
+            ser.close()
+        
+        cap.release()
+        cv2.destroyAllWindows()
+        print("✅ System stopped safely")
+
+if __name__ == "__main__":
+    main()

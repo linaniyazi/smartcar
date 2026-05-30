@@ -43,15 +43,9 @@ arduino = ArduinoBridge()
 
 
 def get_decision_v5(detected_list):
-    """
-    اتخاذ القرار بناءً على القواعد المحددة من قبلك تماماً
-    """
     final_cmd = "GO"
-    
     for obj in detected_list:
         name = obj["name"]
-
-        # 1. تنفيذ أمر STOP
         stop_conditions = [
             "person", "car", "truck", "bus", "motorcycle", "stop sign", "Stop", 
             "TL_RED", "No entry", "Yield", "Road work"
@@ -59,7 +53,6 @@ def get_decision_v5(detected_list):
         if any(x in name for x in stop_conditions):
             return "STOP"
 
-        # 2. تنفيذ أمر SLOW
         slow_conditions = [
             "TL_YELLOW", "Pedestrians", "Children crossing", 
             "Slippery road", "Bumpy road"
@@ -67,23 +60,19 @@ def get_decision_v5(detected_list):
         if any(x in name for x in slow_conditions):
             return "SLOW"
 
-        # 3. تنفيذ أمر SPEED_X
         if "Speed limit" in name:
             speed_match = re.findall(r'\d+', name)
             if speed_match:
                return f"SPEED_{speed_match[0]}"
         
-        # 4. تنفيذ أمر TURN_LEFT
         if "Turn left" in name: 
             return "TURN_LEFT"
             
-        # 5. تنفيذ أمر TURN_RIGHT
         if "Turn right" in name: 
             return "TURN_RIGHT"
 
     return final_cmd
 
-# Traffic Sign Classes (TFLite)
 SIGN_CLASSES = [
     "Speed limit (20km/h)", "Speed limit (30km/h)", "Speed limit (50km/h)",
     "Speed limit (60km/h)", "Speed limit (70km/h)", "Speed limit (80km/h)",
@@ -190,14 +179,14 @@ def get_tflite_interpreter():
     return _tflite_interp
 
 # =============================================================================
-# 4. Helper Functions (تم إضافة خوارزمية تحديد اللون بناءً على الموقع والسطوع)
+# 4. Helper Functions (تم تعديل الخوارزمية هنا لتصبح معتمدة على أعلى نقطة إضاءة)
 # =============================================================================
 def preprocess_yolo(frame, input_size=INPUT_SIZE):
     h, w = frame.shape[:2]
     scale = input_size / max(h, w)
     nh, nw = int(h * scale), int(w * scale)
     resized = cv2.resize(frame, (nw, nh))
-    canvas = np.full((input_size, input_size, 3), 114, dtype=np.uint8)
+    canvas = np.full((input_size, input_size, 114), dtype=np.uint8)
     pad_top  = (input_size - nh) // 2
     pad_left = (input_size - nw) // 2
     canvas[pad_top:pad_top+nh, pad_left:pad_left+nw] = resized
@@ -244,56 +233,37 @@ def postprocess_yolo(outputs, scale, pad_left, pad_top, orig_h, orig_w):
 
 def get_traffic_light_color_v8(image, bbox):
     """
-    تحليل إشارة المرور بناءً على الموقع الجغرافي والسطوع (تجنباً لأشعة الشمس والـ Overexposure)
+    إصدار مطور يعتمد على رصد بؤرة السطوع الأعلى (The Brightest Pixel)
+    لحل مشكلة بهتان الألوان والليدات شديدة السطوع
     """
     x1, y1, x2, y2 = map(int, bbox)
     roi = image[max(0, y1):y2, max(0, x1):x2]
     if roi.size == 0: 
         return "unknown"
     
-    # تحويل منطقة الإشارة إلى صيغة Gray للسطوع وصيغة HSV لتصفية الألوان
+    # تحويل منطقة الإشارة للرمادي وتطبيق فلاتر غاوس لتنعيم النويز
     gray_roi = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
-    hsv_roi = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+    gray_roi = cv2.GaussianBlur(gray_roi, (5, 5), 0)
     
-    roi_h, roi_w = roi.shape[:2]
+    # البحث عن مكان وتفاصيل النقطة الأكثر سطوعاً بداخل الصندوق
+    min_val, max_val, min_loc, max_loc = cv2.minMaxLoc(gray_roi)
     
-    # تقسيم الإشارة أفقياً إلى 3 أقسام متساوية
-    third = roi_h // 3
-    if third == 0: 
+    # عتبة أمان: للتأكد من أن هناك ليد مضيء فعلياً وليس مجرد انعكاس عادي
+    if max_val < 140:
         return "unknown"
-    
-    # 1. اقتطاع الأثلاث الثلاثة (موقعياً)
-    top_zone    = gray_roi[0:third, :]
-    middle_zone = gray_roi[third:2*third, :]
-    bottom_zone = gray_roi[2*third:roi_h, :]
-    
-    # 2. حساب متوسط السطوع الفعلي في كل قسم
-    top_brightness    = np.mean(top_zone) if top_zone.size > 0 else 0
-    middle_brightness = np.mean(middle_zone) if middle_zone.size > 0 else 0
-    bottom_brightness = np.mean(bottom_zone) if bottom_zone.size > 0 else 0
-    
-    # 3. عامل تعزيز التصفية اللمسية للألوان (HSV) لمساعدة السطوع في حالات التعادل
-    red_mask    = cv2.inRange(hsv_roi, np.array([0, 50, 50]), np.array([10, 255, 255])) + \
-                  cv2.inRange(hsv_roi, np.array([170, 50, 50]), np.array([180, 255, 255]))
-    yellow_mask = cv2.inRange(hsv_roi, np.array([15, 50, 50]), np.array([35, 255, 255]))
-    green_mask  = cv2.inRange(hsv_roi, np.array([36, 50, 50]), np.array([89, 255, 255]))
-    
-    # دمج السطوع الفيزيائي مع دلالة اللون المكتشفة لمنع التقلب المستمر
-    score_red    = top_brightness    + (cv2.countNonZero(red_mask[0:third, :]) * 2 if red_mask.size > 0 else 0)
-    score_yellow = middle_brightness + (cv2.countNonZero(yellow_mask[third:2*third, :]) * 2 if yellow_mask.size > 0 else 0)
-    score_green  = bottom_brightness + (cv2.countNonZero(green_mask[2*third:roi_h, :]) * 2 if green_mask.size > 0 else 0)
-    
-    # المقارنة النهائية لاختيار القسم الفائز
-    max_score = max(score_red, score_yellow, score_green)
-    
-    if max_score == score_red:
-        return "red"
-    elif max_score == score_yellow:
-        return "yellow"
-    elif max_score == score_green:
-        return "green"
         
-    return "unknown"
+    # حساب الموضع النسبي الرأسي للنقطة المضيئة (من 0 إلى 1)
+    # max_loc[1] يمثل قيمة الـ Y للنقطة المضيئة
+    roi_h = roi.shape[0]
+    relative_y = max_loc[1] / roi_h
+
+    # التصنيف بناءً على موضع الليد المضيء الفعلي بداخل هيكل الإشارة الليد
+    if relative_y < 0.35:
+        return "red"
+    elif 0.35 <= relative_y <= 0.65:
+        return "yellow"
+    else:
+        return "green"
 
 def classify_sign_crop(crop_bgr):
     try:
@@ -347,8 +317,6 @@ if __name__ == "__main__":
     prev_time = 0
     fps = 0
 
-    print("System Running. Press 'q' to quit.")
-
     try:
         while True:
             ret, frame = cap_thread.read()
@@ -382,8 +350,7 @@ if __name__ == "__main__":
                 x1, y1, x2, y2 = bbox
                 name = COCO_NAMES.get(cls_id, str(cls_id))
 
-                if cls_id == 9: # إشارة المرور الضوئية
-                    # تم استدعاء دالة التحليل الذكية الجديدة المعتمدة على الموقع الثلاثي والسطوع لحل مشكلة الشمس
+                if cls_id == 9: # إشارة المرور
                     color = get_traffic_light_color_v8(frame, (x1, y1, x2, y2))
                     name = f"TL_{color.upper()}"
                     

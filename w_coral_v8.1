@@ -179,14 +179,15 @@ def get_tflite_interpreter():
     return _tflite_interp
 
 # =============================================================================
-# 4. Helper Functions (تم تعديل الخوارزمية هنا لتصبح معتمدة على أعلى نقطة إضاءة)
+# 4. Helper Functions
 # =============================================================================
 def preprocess_yolo(frame, input_size=INPUT_SIZE):
     h, w = frame.shape[:2]
     scale = input_size / max(h, w)
     nh, nw = int(h * scale), int(w * scale)
     resized = cv2.resize(frame, (nw, nh))
-    canvas = np.full((input_size, input_size, 114), dtype=np.uint8)
+    # FIX: تم إصلاح السطوع والأبعاد اللونيّة الثلاثية هنا ليعود النظر للكاميرا فوراً!
+    canvas = np.full((input_size, input_size, 3), 114, dtype=np.uint8)
     pad_top  = (input_size - nh) // 2
     pad_left = (input_size - nw) // 2
     canvas[pad_top:pad_top+nh, pad_left:pad_left+nw] = resized
@@ -249,18 +250,17 @@ def get_traffic_light_color_v8(image, bbox):
     min_val, max_val, min_loc, max_loc = cv2.minMaxLoc(gray_roi)
     
     # عتبة أمان: للتأكد من أن هناك ليد مضيء فعلياً وليس مجرد انعكاس عادي
-    if max_val < 140:
+    if max_val < 130:
         return "unknown"
         
     # حساب الموضع النسبي الرأسي للنقطة المضيئة (من 0 إلى 1)
-    # max_loc[1] يمثل قيمة الـ Y للنقطة المضيئة
     roi_h = roi.shape[0]
     relative_y = max_loc[1] / roi_h
 
     # التصنيف بناءً على موضع الليد المضيء الفعلي بداخل هيكل الإشارة الليد
-    if relative_y < 0.35:
+    if relative_y < 0.38:
         return "red"
-    elif 0.35 <= relative_y <= 0.65:
+    elif 0.38 <= relative_y <= 0.65:
         return "yellow"
     else:
         return "green"

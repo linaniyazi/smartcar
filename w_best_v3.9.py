@@ -18,7 +18,7 @@ import re
 # =============================================================================
 
 YOLO_ONNX_PATH       = '/home/smartcar/coral_env/models_/yolov8n.onnx'
-YOLO_SIGNS_ONNX_PATH = '/home/smartcar/coral_env/models_/signs_yolo.onnx' # ⚠️ ضع مسار موديل يولو الشاخصات الجديد (42 كلاس) هنا
+YOLO_SIGNS_ONNX_PATH = '/home/smartcar/coral_env/models_/best.onnx' # ⚠️ ضع مسار موديل يولو الشاخصات الجديد (42 كلاس) هنا
 TFLITE_PATH          = '/home/smartcar/coral_env/models_/model_RTSR.tflite'
 CONF_THRESHOLD       = 0.25
 IOU_THRESHOLD        = 0.45
